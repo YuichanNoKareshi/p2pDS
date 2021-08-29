@@ -75,6 +75,13 @@ pub struct BlockResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct Distribute {
+    pub block_id: String,
+    pub data: Vec<u8>,
+    pub receiver: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RecoverRequest {
     pub uuid: String,
     pub block_id: String,

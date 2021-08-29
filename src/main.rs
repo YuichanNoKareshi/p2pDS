@@ -13,7 +13,7 @@ use libp2p::{
 use log::{error, info, debug, warn};
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::{collections::{HashMap, HashSet}, io::Write};
 use tokio::{fs, io::AsyncBufReadExt, sync::mpsc};
 #[macro_use]
 extern crate lazy_static;
@@ -75,6 +75,7 @@ static TOPIC: Lazy<IdentTopic> = Lazy::new(|| IdentTopic::new("datablocks".to_st
 enum EventType {
     Response(ListResponse),
     BlockResponse(BlockResponse),
+    Distribute(Distribute),
     ProofPublish(SealerOutput),
     ProofResponse(ProofResponse),
     RecoverRequest(RecoverRequest),
@@ -102,6 +103,8 @@ struct DataBlockBehaviour {
     recoverresp_sender: mpsc::UnboundedSender<RecoverResponse>,
     #[behaviour(ignore)]
     broadcast_sender: mpsc::UnboundedSender<String>,
+    #[behaviour(ignore)]
+    distribute_sender: mpsc::UnboundedSender<Distribute>, 
     // #[behaviour(ignore)]
     // proof_sender: mpsc::UnboundedSender<ProofResponse>,
     // #[behaviour(ignore)]
@@ -115,7 +118,9 @@ impl NetworkBehaviourEventProcess<GossipsubEvent> for DataBlockBehaviour {
                 if let Ok(broad) = serde_json::from_slice::<PeerInfoBroadcast>(&msg.data) {
                     debug!("{:?}", broad);
                     let mut p = PEERINFO.lock().unwrap();
+                    // broadcast the local blocks
                     // let peer_id = broad.peer_id;
+                    println!("{:?}", broad);
                     for (block_id, block) in broad.local_blocks.iter() {
                         let remote_block = DataBlock {
                             block_id: block_id.to_string(),
@@ -166,6 +171,12 @@ impl NetworkBehaviourEventProcess<GossipsubEvent> for DataBlockBehaviour {
                         info!("Response from {}:", peer_id);
                         extract_block(resp);
                     }
+                } else if let Ok(resp) = serde_json::from_slice::<Distribute>(&msg.data) {
+                    debug!("{:?}", resp);
+                    if resp.receiver == PEER_ID.to_string() {
+                        info!("Distributed from {}:", peer_id);
+                        save_file(&resp.data, &resp.block_id, STORAGE_BLOCK_PATH).unwrap();
+                    }
                 } else if let Ok(req) = serde_json::from_slice::<RecoverResponse>(&msg.data) {
                     debug!("{:?}", req);
                     if req.receiver == PEER_ID.to_string() {
@@ -173,6 +184,7 @@ impl NetworkBehaviourEventProcess<GossipsubEvent> for DataBlockBehaviour {
                     }
                 } else if let Ok(req) = serde_json::from_slice::<RecoverRequest>(&msg.data) {
                     debug!("{:?}", req);
+                    //recover the block
                     if req.receiver == PEER_ID.to_string() {
                         respond_block(
                             self.recoverreq_sender.clone(),
@@ -251,6 +263,26 @@ fn respond_data(sender: mpsc::UnboundedSender<BlockResponse>, receiver: String, 
     });
 }
 
+fn distribute_to_peer(sender: mpsc::UnboundedSender<Distribute>, receiver: String, block_id: String) {
+    tokio::spawn(async move {
+        match read_block_data(block_id.clone()).await {
+            Ok((filemeta, bytes)) => {
+                // println!("{:?}", filemeta);
+                // println!("{:?}", filemeta.file_id);
+                let resp = Distribute {
+                    block_id,
+                    data: bytes,
+                    receiver,
+                };
+                if let Err(e) = sender.send(resp) {
+                    error!("error distributing via channel, {}", e);
+                }
+            }
+            Err(e) => error!("error fetching local recipes to answer ALL request, {}", e),
+        }
+    });
+}
+
 fn respond_block(sender: mpsc::UnboundedSender<RecoverResponse>, receiver: String, block_id: String, uuid: String) {
     tokio::spawn(async move {
         match read_block_data(block_id.clone()).await {
@@ -322,7 +354,7 @@ async fn read_local_block_metadata() -> Result<Vec<String>> {
     Ok(vec)
 }
 
-async fn store_file(cmd: &str, _swarm: &mut Swarm<DataBlockBehaviour>) {
+async fn store_file(cmd: &str, _swarm: &mut Swarm<DataBlockBehaviour>, sender: mpsc::UnboundedSender<Distribute>) {
     let rest = cmd.strip_prefix("store ");
     match rest {
         Some(file_name) => {
@@ -335,9 +367,9 @@ async fn store_file(cmd: &str, _swarm: &mut Swarm<DataBlockBehaviour>) {
             };
             let file_bytes = read_file(file_name).await.unwrap();
             let file_size = file_bytes.len();
-            let block_size = file_size / usize::from(CODE_M);
+            let block_size = file_size / usize::from(CODE_M); // CODE_M = 6
         
-            let mut vec: Vec<Vec<u8>> = Vec::new();
+            let mut vec: Vec<Vec<u8>> = Vec::new(); // vec of block(vec)
             let mut uuids: Vec<String> = Vec::new();
             for i in 0..usize::from(CODE_M) {
                 let block = file_bytes[i * block_size..(i+1) * block_size].to_vec();
@@ -347,15 +379,17 @@ async fn store_file(cmd: &str, _swarm: &mut Swarm<DataBlockBehaviour>) {
                 file_meta.data_blocks.push(uid.clone());
                 uuids.push(uid);
             }
+
             let mut vec_temp: Vec<u8> = Vec::new();
             for i in 0..block_size {
-                vec_temp.push(vec[1][i] ^ 0);
+                vec_temp.push(vec[1][i] ^ 0); // vec[1][i] OR 0
             }
             vec.push(vec_temp.clone());
             let uuid6 = Uuid::new_v4().to_simple().to_string();
             let uid6 = store_file_block(uuid6, vec_temp).await;
             file_meta.parity_blocks.push(uid6.clone());
             uuids.push(uid6);
+
             vec_temp = Vec::new();
             for i in 0..block_size {
                 vec_temp.push(vec[5][i] ^ 0);
@@ -365,6 +399,7 @@ async fn store_file(cmd: &str, _swarm: &mut Swarm<DataBlockBehaviour>) {
             let uid7 = store_file_block(uuid7, vec_temp).await;
             file_meta.parity_blocks.push(uid7.clone());
             uuids.push(uid7);
+
             vec_temp = Vec::new();
             for i in 0..block_size {
                 vec_temp.push(vec[0][i] ^ vec[3][i]);
@@ -374,6 +409,7 @@ async fn store_file(cmd: &str, _swarm: &mut Swarm<DataBlockBehaviour>) {
             let uid8 = store_file_block(uuid8, vec_temp).await;
             file_meta.parity_blocks.push(uid8.clone());
             uuids.push(uid8);
+
             vec_temp = Vec::new();
             for i in 0..block_size {
                 vec_temp.push(vec[2][i] ^ vec[4][i]);
@@ -429,6 +465,34 @@ async fn store_file(cmd: &str, _swarm: &mut Swarm<DataBlockBehaviour>) {
             let j = serde_json::to_string(&*p).unwrap();
             fs::write(STORAGE_FILE_PATH, j).await.expect("Unable to write file");
             info!("Stored file id {}", file_id);
+
+            let nodes = _swarm.mdns.discovered_nodes();
+            let mut unique_peers = HashSet::new();
+            for peer in nodes {
+                unique_peers.insert(peer);
+            }
+            let peer_num = unique_peers.len(); // number of unique peers 
+            println!("{:?}", peer_num);
+
+            if peer_num > 0 {
+                for i in 0..uuids.len() {
+                    let flag = i % peer_num;
+                    let mut index = 0;
+                    for temp_peer in unique_peers.iter() {
+                        if index == flag {
+                            // println!("{:?}", temp_peer.to_string());
+                            distribute_to_peer(
+                                sender.clone(),
+                                temp_peer.to_string(),
+                                uuids.get(i).unwrap().to_string(),
+                            );
+                        }
+                        else {
+                            index += 1;
+                        }
+                    }
+                }
+            }
         },
         None => error!("No file specified"),
     }
@@ -532,25 +596,26 @@ async fn handle_get_block(cmd: &str, swarm: &mut Swarm<DataBlockBehaviour>) {
     let rest = cmd.strip_prefix("get ");
     match rest {
         Some(block_id) => {
-            let block_meta = get_metadataby_id(block_id.to_string()).await.unwrap();
-            if block_meta.local {
-                let (_, bytes): (DataBlock, Vec<u8>) = read_block_data(block_id.to_string()).await.unwrap();
-                info!("{:?}", bytes);
-            } else {
-                // let mut receiver: String;
-                // for pid in block_meta.peers {
-                //     if pid != PEER_ID.to_string() {
-                //         receiver = pid;
-                //         break;
-                //     }
-                // }
-                let req = BlockRequest {
-                    block_id: block_meta.block_id.to_string(),
-                    receiver: block_meta.peers.first().unwrap().to_string(),
-                };
-                let json = serde_json::to_string(&req).expect("can jsonify request");
-                swarm.gossipsub.publish(TOPIC.clone(), json.as_bytes()).expect("swarm publish failed");
+            let meta_result = get_metadataby_id(block_id.to_string()).await;
+            let meta_tmp = meta_result.clone();
+            match meta_result {
+                Ok(_) => {
+                    let block_meta =meta_tmp.unwrap();
+                    if block_meta.local {
+                        let (_, bytes): (DataBlock, Vec<u8>) = read_block_data(block_id.to_string()).await.unwrap();
+                            info!("{:?}", bytes);
+                    } else {
+                        let req = BlockRequest {
+                            block_id: block_meta.block_id.to_string(),
+                            receiver: block_meta.peers.first().unwrap().to_string(),
+                        };
+                        let json = serde_json::to_string(&req).expect("can jsonify request");
+                        swarm.gossipsub.publish(TOPIC.clone(), json.as_bytes()).expect("swarm publish failed");
+                    }
+                },
+                Err(_) => error!("no block id, type ls r to see the block id"),
             }
+            
         },
         None => error!("error fetching local recipes to answer ALL request"),
     };
@@ -728,6 +793,67 @@ fn cleanup() {
     std::fs::write(STORAGE_FILE_PATH, j).expect("Unable to write file");
 }
 
+fn handle_help(cmd :&str) {
+    let rest = cmd.strip_prefix("help ");
+    match rest {
+        Some(cmd_tmp) => {
+            match cmd_tmp {
+                "ls" => {
+                    println!("ls [p | r]");
+                    println!("  p: Show all the peers discovered");
+                    println!("  r: Show all the recipes in this peer");
+                },
+                "get" => {
+                    println!("get [bid]");
+                    println!("  bid: The block id");
+                    println!("  Show the content by bid. You can type ls r to see the block id in local");
+                    println!("  The content will be shown by ASCII");
+                },
+                "clean" => {
+                    println!("clean the metadata");
+                },
+                "cast" => {
+                    println!("broadcast to the peers discovered");
+                },
+                "store" => {
+                    println!("store [fname]");
+                    println!("  Store the file by fname. Be sure you have created a directory named blocks");
+                },
+                "load" => {
+                    println!("load [unsealed_cid]");
+                    println!("  Load the file. This function will find all this file's blocks and extract them to the directory named extract");
+                    println!("  Be sure you have created a directory named blocks");
+                },
+                "prove" => {
+                    println!("prove [unsealed_cid]");
+                    println!("  Prove the file")
+                },
+                "recover" => {
+                    println!("recover [bid]");
+                    println!("  Recover the block by bid");
+                }
+                "cid" => {
+                    println!("cid [unsealed_cid] [ssize]");
+                    println!("  ssize should be 8, 32 or 512");
+                }
+                _ => println!("No such command!")
+            }
+            
+        },
+        None => {
+            println!("Welcome to p2pDS!\nThese shell commands are defined internally.  Type `help' to see this list.\nType `help name' to find out more about the function `name'.\n");
+            println!("ls [p | r]");
+            println!("get [bid]");
+            println!("load [fid]");
+            println!("store [fname]");
+            println!("recover [bid]");
+            println!("prove [unsealed_cid]");
+            println!("cid [unsealed_cid] [ssize]");
+            println!("clean");
+            println!("cast")
+        },
+    };
+}
 // async fn load_file(fname: &str) -> Result<Vec<u8>> {
 //     let mut path = STORAGE_BLOCK_PATH.to_string();
 //     path.push_str(fname);
@@ -751,12 +877,13 @@ async fn main() -> Result<()>
     let (recoverresp_sender, mut recoverresp_rcv) = mpsc::unbounded_channel();
     let (prove_tx, mut prove_rx) = mpsc::unbounded_channel();
     let (broadcast_sender, mut broadcast_rcv) = mpsc::unbounded_channel();
+    let (distribute_sender, mut distribute_rcv) = mpsc::unbounded_channel();
     let mut channels: HashMap<String, mpsc::UnboundedSender<RecoverResponse>> = HashMap::new();
     let peer_info = load_peer_data();
     let data_blocks = peer_info.data_blocks.clone();
     {
         let mut local_blocks = LOCAL_BLOCKS.lock().unwrap();
-        for (block_id, block) in data_blocks.iter() {
+        for (block_id, block) in data_blocks.iter() { // data_blocks: HashMap<String, DataBlock>
             for peer in block.peers.iter() {
                 if *peer != PEER_ID.to_string() {
                     let mut prove_status = PROVE_STATUS.lock().unwrap();
@@ -809,6 +936,7 @@ async fn main() -> Result<()>
         recoverreq_sender,
         recoverresp_sender,
         broadcast_sender: broadcast_sender.clone(),
+        distribute_sender: distribute_sender.clone(),
         // proof_sender,
         // test_sender,
     };
@@ -833,6 +961,8 @@ async fn main() -> Result<()>
 
     let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(180));
     loop {
+        print!("> ");
+        std::io::stdout().flush();
         let evt = {
             tokio::select! {
                 line = stdin.next_line() => Some(EventType::Input(line.expect("can get line").expect("can read line from stdin"))),
@@ -842,6 +972,7 @@ async fn main() -> Result<()>
                 },
                 response = response_rcv.recv() => Some(EventType::Response(response.expect("response exists"))),
                 block_response = block_rcv.recv() => Some(EventType::BlockResponse(block_response.expect("response exists"))),
+                distribute_event = distribute_rcv.recv() => Some(EventType::Distribute(distribute_event.expect("event exists"))),
                 recover0_response = recoverreq0_rcv.recv() => Some(EventType::RecoverRequest(recover0_response.expect("response exists"))),
                 recover_response = recoverreq_rcv.recv() => Some(EventType::RecoverReqResponse(recover_response.expect("response exists"))),
                 recoverresp_response = recoverresp_rcv.recv() => Some(EventType::RecoverRespResponse(recoverresp_response.expect("response exists"))),
@@ -863,6 +994,10 @@ async fn main() -> Result<()>
                 }
                 EventType::BlockResponse(resp) => {
                     let json = serde_json::to_string(&resp).expect("can jsonify response");
+                    swarm.gossipsub.publish(TOPIC.clone(), json.as_bytes()).expect("swarm publish failed");
+                }
+                EventType::Distribute(resp) => {
+                    let json = serde_json::to_string(&resp).expect("can jsonify distribute");
                     swarm.gossipsub.publish(TOPIC.clone(), json.as_bytes()).expect("swarm publish failed");
                 }
                 EventType::ProofResponse(resp) => {
@@ -901,7 +1036,7 @@ async fn main() -> Result<()>
                     cmd if cmd.starts_with("ls r") => handle_list_blocks(cmd, &mut swarm).await,
                     cmd if cmd.starts_with("get") => handle_get_block(cmd, &mut swarm).await,
                     cmd if cmd.starts_with("load") => extract_file(cmd, &mut swarm).await,
-                    cmd if cmd.starts_with("store") => store_file(cmd, &mut swarm).await,
+                    cmd if cmd.starts_with("store") => store_file(cmd, &mut swarm, distribute_sender.clone()).await,
                     cmd if cmd.starts_with("cast") => {
                         tokio::spawn(broadcast(broadcast_sender.clone(), LOCAL_BLOCKS.lock().unwrap().clone()));
                     },
@@ -947,41 +1082,52 @@ async fn main() -> Result<()>
                         }
                     },
                     cmd if cmd.starts_with("cid") => {
-                        let rest = cmd.strip_prefix("cid ").unwrap();
-                        let mut opt = rest.split(" ");
-                        let vec: Vec<&str> = opt.collect();
-                        let file_name = vec[0];
-                        let ssize = vec[1];
-                        let proof_groups: Vec<ProofGroup>;
-                        {
-                            let peer_info = PEERINFO.lock().unwrap();
-                            proof_groups = peer_info.proof_groups.clone();
-                        }
-                        if let Some(proof_group) = proof_groups.iter().find(|&p| p.unsealed_cid == file_name) {
-                            let sector_size: u64;
-                            match ssize {
-                                "8" => {
-                                    sector_size = 8388608;
-                                    let _child = tokio::spawn(get_cid(proof_group.clone(), sector_size));
-                                },
-                                "512" => {
-                                    sector_size = 536870912;
-                                    let _child = tokio::spawn(get_cid(proof_group.clone(), sector_size));
-                                },
-                                "32" => {
-                                    sector_size = 34359738368;
-                                    let _child = tokio::spawn(get_cid(proof_group.clone(), sector_size));
-                                },
-                                _ => error!("Wrong sector size specified"),
-                            }
-                        }
-                        else {
-                            error!("No such block in local");
+                        let rest_tmp = cmd.strip_prefix("cid ");
+                        match rest_tmp {
+                            Some(rest) => {
+                                let opt = rest.split(" ");
+                                let vec: Vec<&str> = opt.collect();
+                                if vec.len()==2 {
+                                    let file_name = vec[0];
+                                    let ssize = vec[1];
+                                    let proof_groups: Vec<ProofGroup>;
+                                    {
+                                        let peer_info = PEERINFO.lock().unwrap();
+                                        proof_groups = peer_info.proof_groups.clone();
+                                    }
+                                    if let Some(proof_group) = proof_groups.iter().find(|&p| p.unsealed_cid == file_name) {
+                                        let sector_size: u64;
+                                        match ssize {
+                                            "8" => {
+                                                sector_size = 8388608;
+                                                let _child = tokio::spawn(get_cid(proof_group.clone(), sector_size));
+                                            },
+                                            "512" => {
+                                                sector_size = 536870912;
+                                                let _child = tokio::spawn(get_cid(proof_group.clone(), sector_size));
+                                            },
+                                            "32" => {
+                                                sector_size = 34359738368;
+                                                let _child = tokio::spawn(get_cid(proof_group.clone(), sector_size));
+                                            },
+                                            _ => error!("Wrong sector size specified"),
+                                        }
+                                    }
+                                    else {
+                                        error!("No such block in local");
+                                    }
+                                }
+                                else {
+                                    error!("Missing parameter! Type help cid to check")
+                                }
+                            },
+                            None => error!("Missing parameter! Type help cid to check"),
                         }
                     },
                     cmd if cmd.starts_with("clean") => {
                         cleanup();
                     },
+                    cmd if cmd.starts_with("help") => handle_help(cmd),
                     cmd if cmd.starts_with("bench") => {
                         let rest = cmd.strip_prefix("bench ");
                         match rest {
@@ -1000,7 +1146,7 @@ async fn main() -> Result<()>
                             None => error!("No bench specified"),
                         }
                     },
-                    _ => error!("unknown command"),
+                    _ => error!("unknown command,type help to check"),
                 }
                 // EventType::Timer() => {
                 //     let child = tokio::spawn(start_period(prove_tx.clone()));
